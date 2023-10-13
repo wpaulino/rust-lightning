@@ -468,6 +468,10 @@ mod state_flags {
 	pub const LOCAL_SHUTDOWN_SENT: u32 = 1 << 11;
 	pub const SHUTDOWN_COMPLETE: u32 = 1 << 12;
 	pub const WAITING_FOR_BATCH: u32 = 1 << 13;
+	pub const AWAITING_QUIESCENCE: u32 = 1 << 14;
+	pub const LOCAL_STFU_SENT: u32 = 1 << 15;
+	pub const REMOTE_STFU_SENT: u32 = 1 << 16;
+	pub const CHANNEL_QUIESCENT: u32 = 1 << 17;
 }
 
 define_state_flags!(
@@ -526,7 +530,13 @@ define_state_flags!(
 			messages as we'd be unable to determine which HTLCs they included in their `revoke_and_ack` \
 			implicit ACK, so instead we have to hold them away temporarily to be sent later.",
 			AWAITING_REMOTE_REVOKE, state_flags::AWAITING_REMOTE_REVOKE,
-			is_awaiting_remote_revoke, set_awaiting_remote_revoke, clear_awaiting_remote_revoke)
+			is_awaiting_remote_revoke, set_awaiting_remote_revoke, clear_awaiting_remote_revoke),
+		("", AWAITING_QUIESCENCE, state_flags::AWAITING_QUIESCENCE,
+			is_awaiting_quiescence, set_awaiting_quiescence, clear_awaiting_quiescence),
+		("", LOCAL_STFU_SENT, state_flags::LOCAL_STFU_SENT,
+			is_local_stfu_sent, set_local_stfu_sent, clear_local_stfu_sent),
+		("", REMOTE_STFU_SENT, state_flags::REMOTE_STFU_SENT,
+			is_remote_stfu_sent, set_remote_stfu_sent, clear_remote_stfu_sent)
 	]
 );
 
@@ -546,6 +556,7 @@ enum ChannelState {
 	/// Both we and our counterparty consider the funding transaction confirmed and the channel is
 	/// now operational.
 	ChannelReady(ChannelReadyFlags),
+	ChannelQuiescent,
 	/// We've successfully negotiated a `closing_signed` dance. At this point, the `ChannelManager`
 	/// is about to drop us, but we store this anyway.
 	ShutdownComplete,
@@ -594,6 +605,7 @@ impl ChannelState {
 		match state {
 			state_flags::FUNDING_NEGOTIATED => Ok(ChannelState::FundingNegotiated),
 			state_flags::SHUTDOWN_COMPLETE => Ok(ChannelState::ShutdownComplete),
+			state_flags::CHANNEL_QUIESCENT => Ok(ChannelState::ChannelQuiescent),
 			val => {
 				if val & state_flags::AWAITING_CHANNEL_READY == state_flags::AWAITING_CHANNEL_READY {
 					AwaitingChannelReadyFlags::from_u32(val & !state_flags::AWAITING_CHANNEL_READY)
@@ -616,6 +628,7 @@ impl ChannelState {
 			ChannelState::FundingNegotiated => state_flags::FUNDING_NEGOTIATED,
 			ChannelState::AwaitingChannelReady(flags) => state_flags::AWAITING_CHANNEL_READY | flags.0,
 			ChannelState::ChannelReady(flags) => state_flags::CHANNEL_READY | flags.0,
+			ChannelState::ChannelQuiescent => state_flags::CHANNEL_QUIESCENT,
 			ChannelState::ShutdownComplete => state_flags::SHUTDOWN_COMPLETE,
 		}
 	}
@@ -640,8 +653,10 @@ impl ChannelState {
 		match self {
 			ChannelState::ChannelReady(flags) =>
 				!flags.is_set(ChannelReadyFlags::AWAITING_REMOTE_REVOKE) &&
+					!flags.is_set(ChannelReadyFlags::LOCAL_STFU_SENT) &&
 					!flags.is_set(FundedStateFlags::MONITOR_UPDATE_IN_PROGRESS.into()) &&
 					!flags.is_set(FundedStateFlags::PEER_DISCONNECTED.into()),
+			ChannelState::ChannelQuiescent => false,
 			_ => {
 				debug_assert!(false, "Can only generate new commitment within ChannelReady");
 				false
@@ -657,6 +672,9 @@ impl ChannelState {
 	impl_state_flag!(is_their_channel_ready, set_their_channel_ready, clear_their_channel_ready, AwaitingChannelReady);
 	impl_state_flag!(is_waiting_for_batch, set_waiting_for_batch, clear_waiting_for_batch, AwaitingChannelReady);
 	impl_state_flag!(is_awaiting_remote_revoke, set_awaiting_remote_revoke, clear_awaiting_remote_revoke, ChannelReady);
+	impl_state_flag!(is_awaiting_quiescence, set_awaiting_quiescence, clear_awaiting_quiescence, ChannelReady);
+	impl_state_flag!(is_local_stfu_sent, set_local_stfu_sent, clear_local_stfu_sent, ChannelReady);
+	impl_state_flag!(is_remote_stfu_sent, set_remote_stfu_sent, clear_remote_stfu_sent, ChannelReady);
 }
 
 pub const INITIAL_COMMITMENT_NUMBER: u64 = (1 << 48) - 1;
@@ -1495,6 +1513,10 @@ pub(super) struct ChannelContext<SP: Deref> where SP::Target: SignerProvider {
 	/// If we can't release a [`ChannelMonitorUpdate`] until some external action completes, we
 	/// store it here and only release it to the `ChannelManager` once it asks for it.
 	blocked_monitor_updates: Vec<PendingChannelMonitorUpdate>,
+
+	/// TODO
+	pending_counterparty_stfu: Option<msgs::Stfu>,
+	quiescence_initiator: Option<bool>,
 }
 
 impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
@@ -1835,6 +1857,9 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			blocked_monitor_updates: Vec::new(),
 
 			is_manual_broadcast: false,
+
+			pending_counterparty_stfu: None,
+			quiescence_initiator: None,
 		};
 
 		Ok(channel_context)
@@ -2066,6 +2091,9 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 			blocked_monitor_updates: Vec::new(),
 			local_initiated_shutdown: None,
 			is_manual_broadcast: false,
+
+			pending_counterparty_stfu: None,
+			quiescence_initiator: None,
 		})
 	}
 
@@ -2143,6 +2171,87 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 	/// Allowed in any state (including after shutdown)
 	pub fn is_live(&self) -> bool {
 		self.is_usable() && !self.channel_state.is_peer_disconnected()
+	}
+
+	/// TODO(stfu)
+	pub fn is_state_machine_pending<L: Deref>(&self, logger: &L) -> bool where L::Target: Logger {
+		if self.expecting_peer_commitment_signed {
+			log_trace!(logger, "WILMER awaiting commit sig");
+			return true;
+		}
+		if self.channel_state.is_awaiting_remote_revoke() {
+			log_trace!(logger, "WILMER awaiting remote revoke");
+			return true;
+		}
+		// TODO: Do we need to check whether we are resending `commitment_signed/revoke_and_ack`
+		// indicating we are in a "pending" state?
+		if self.monitor_pending_commitment_signed || self.monitor_pending_revoke_and_ack {
+			// TODO: Replace with pending commit sig/RAA. Move to check monitor update in progress
+			// separately outside.
+			log_trace!(logger, "WILMER monitor_pending_commitment_signed={} monitor_pending_revoke_and_ack={}",
+				self.monitor_pending_commitment_signed, self.monitor_pending_revoke_and_ack);
+			return true;
+		}
+		let has_uncommitted_outbound_htlc = self.pending_outbound_htlcs.iter()
+			.any(|htlc| match htlc.state {
+				OutboundHTLCState::Committed => false,
+				_ => true,
+			});
+		let has_uncommitted_inbound_htlc = self.pending_inbound_htlcs.iter()
+			.any(|htlc| match htlc.state {
+				InboundHTLCState::Committed => false,
+				_ => true,
+			});
+		log_trace!(logger, "WILMER uncommitted_inbound={}, uncommitted_outbound={}, pending_update_fee={}, has_holding_cell_htlc={}, has_holding_cell_update_fee={}",
+			has_uncommitted_inbound_htlc, has_uncommitted_outbound_htlc, self.pending_update_fee.is_some(), !self.holding_cell_htlc_updates.is_empty(), self.holding_cell_update_fee.is_some());
+		// has_uncommitted_inbound_htlc || has_uncommitted_outbound_htlc || self.pending_update_fee.is_some() ||
+		// 	!self.holding_cell_htlc_updates.is_empty() || self.holding_cell_update_fee.is_some()
+		has_uncommitted_inbound_htlc || has_uncommitted_outbound_htlc || self.pending_update_fee.is_some()
+	}
+
+	/// Holding cell updates are never considered because they haven't been sent to the peer yet.
+	//
+	// TODO: Is this overkill? Check with Matt
+	pub fn node_has_pending_update<L: Deref>(&self, local: bool, logger: &L) -> bool where L::Target: Logger {
+		let has_pending_fee_update = if (local && self.is_outbound()) || (!local && !self.is_outbound()) {
+			self.pending_update_fee.is_some()
+		} else {
+			false
+		};
+		let has_pending_htlc_update = if local {
+			let has_pending_update_for_outbound_htlc = self.pending_outbound_htlcs.iter().any(|htlc| match htlc.state {
+				OutboundHTLCState::LocalAnnounced(_) => true,
+				OutboundHTLCState::Committed => false,
+				OutboundHTLCState::RemoteRemoved(_) => false,
+				OutboundHTLCState::AwaitingRemoteRevokeToRemove(_) => false,
+				OutboundHTLCState::AwaitingRemovedRemoteRevoke(_) => false,
+			});
+			let has_pending_update_for_inbound_htlc = self.pending_inbound_htlcs.iter().any(|htlc| match htlc.state {
+				InboundHTLCState::LocalRemoved(_) => true,
+				InboundHTLCState::Committed => false,
+				InboundHTLCState::RemoteAnnounced(_) => false,
+				InboundHTLCState::AwaitingRemoteRevokeToAnnounce(_) => false,
+				InboundHTLCState::AwaitingAnnouncedRemoteRevoke(_) => false,
+			});
+			has_pending_update_for_outbound_htlc || has_pending_update_for_inbound_htlc
+		} else {
+			let has_pending_update_for_outbound_htlc = self.pending_outbound_htlcs.iter().any(|htlc| match htlc.state {
+				OutboundHTLCState::AwaitingRemoteRevokeToRemove(_) => true,
+				OutboundHTLCState::AwaitingRemovedRemoteRevoke(_) => true,
+				OutboundHTLCState::RemoteRemoved(_) => true,
+				OutboundHTLCState::LocalAnnounced(_) => false,
+				OutboundHTLCState::Committed => false,
+			});
+			let has_pending_update_for_inbound_htlc = self.pending_inbound_htlcs.iter().any(|htlc| match htlc.state {
+				InboundHTLCState::RemoteAnnounced(_) => true,
+				InboundHTLCState::AwaitingRemoteRevokeToAnnounce(_) => true,
+				InboundHTLCState::AwaitingAnnouncedRemoteRevoke(_) => true,
+				InboundHTLCState::Committed => false,
+				InboundHTLCState::LocalRemoved(_) => false,
+			});
+			has_pending_update_for_outbound_htlc || has_pending_update_for_inbound_htlc
+		};
+		has_pending_fee_update || has_pending_htlc_update || self.expecting_peer_commitment_signed
 	}
 
 	// Public utilities:
@@ -4108,7 +4217,9 @@ impl<SP: Deref> Channel<SP> where
 		&mut self, htlc_id_arg: u64, err_contents: E, mut force_holding_cell: bool,
 		logger: &L
 	) -> Result<Option<E::Message>, ChannelError> where L::Target: Logger {
-		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) {
+		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_)) &&
+			!matches!(self.context.channel_state, ChannelState::ChannelQuiescent)
+		{
 			panic!("Was asked to fail an HTLC when channel was not in an operational state");
 		}
 
@@ -4729,6 +4840,7 @@ impl<SP: Deref> Channel<SP> where
 	) -> (Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>)
 	where F::Target: FeeEstimator, L::Target: Logger
 	{
+		assert!(matches!(self.context.channel_state, ChannelState::ChannelReady(_)));
 		assert!(!self.context.channel_state.is_monitor_update_in_progress());
 		if self.context.holding_cell_htlc_updates.len() != 0 || self.context.holding_cell_update_fee.is_some() {
 			log_trace!(logger, "Freeing holding cell with {} HTLC updates{} in channel {}", self.context.holding_cell_htlc_updates.len(),
@@ -4762,7 +4874,13 @@ impl<SP: Deref> Channel<SP> where
 							amount_msat, *payment_hash, cltv_expiry, source.clone(), onion_routing_packet.clone(),
 							false, skimmed_fee_msat, blinding_point, fee_estimator, logger
 						) {
-							Ok(_) => update_add_count += 1,
+							Ok(update_add_msg_opt) => {
+								debug_assert!(
+									update_add_msg_opt.is_some(),
+									"Must generate new update if we're freeing the holding cell"
+								);
+								update_add_count += 1;
+							},
 							Err(e) => {
 								match e {
 									ChannelError::Ignore(ref msg) => {
@@ -5289,6 +5407,22 @@ impl<SP: Deref> Channel<SP> where
 
 		self.context.sent_message_awaiting_response = None;
 
+		match self.context.channel_state {
+			ChannelState::ChannelReady(_) => {
+				log_trace!(logger, "WILMER No longer trying quiescence, peer disconnected");
+				self.context.channel_state.clear_awaiting_quiescence();
+				self.context.channel_state.clear_local_stfu_sent();
+				self.context.channel_state.clear_remote_stfu_sent();
+				self.context.pending_counterparty_stfu.take();
+			},
+			ChannelState::ChannelQuiescent => {
+				log_trace!(logger, "WILMER No longer quiescent, peer disconnected");
+				self.context.channel_state = ChannelState::ChannelReady(ChannelReadyFlags::new());
+				self.context.pending_counterparty_stfu.take();
+				self.context.quiescence_initiator.take();
+			},
+			_ => {},
+		}
 		self.context.channel_state.set_peer_disconnected();
 		log_trace!(logger, "Peer disconnection resulted in {} remote-announced HTLC drops on channel {}", inbound_drop_count, &self.context.channel_id());
 		Ok(())
@@ -7618,6 +7752,108 @@ impl<SP: Deref> Channel<SP> where
 			})
 			.chain(self.context.pending_outbound_htlcs.iter().map(|htlc| (&htlc.source, &htlc.payment_hash)))
 	}
+
+	pub fn propose_quiescence<L: Deref>(&mut self, logger: &L) -> Result<Option<msgs::Stfu>, &'static str> where L::Target: Logger {
+		if !self.context.is_live() {
+			return Err("Channel is not in a live state to propose quiescence");
+		}
+		if self.context.channel_state.is_awaiting_quiescence() || self.context.channel_state.is_local_stfu_sent() {
+			// TODO(stfu): Should this return an error?
+			return Ok(None);
+		}
+		self.context.channel_state.set_awaiting_quiescence();
+		Ok(self.send_stfu(logger).ok())
+	}
+
+	pub fn send_stfu<L: Deref>(&mut self, logger: &L) -> Result<msgs::Stfu, ChannelError> where L::Target: Logger {
+		if !self.context.channel_state.is_awaiting_quiescence() || !self.context.channel_state.is_remote_stfu_sent() {
+			return Err(ChannelError::Ignore("We cannot send `stfu` if we're not attempting to become quiescent or we've already sent it".to_owned()));
+		}
+
+		if !self.context.is_live() {
+			return Err(ChannelError::Ignore("We cannot send `stfu` when we are not in a live state".to_owned()));
+		}
+		if self.context.node_has_pending_update(true, logger) {
+			return Err(ChannelError::Ignore("We cannot send `stfu` while state machine is pending".to_owned()));
+		}
+		if self.context.channel_state.is_local_stfu_sent() {
+			return Err(ChannelError::Ignore("We already sent `stfu` and we've yet to become quiescent".to_owned()));
+		}
+		if self.context.channel_state.is_monitor_update_in_progress() {
+			return Err(ChannelError::Ignore("We cannot send `stfu` while monitor update is pending completion".to_owned()));
+		}
+
+		if let Some(stfu) = self.context.pending_counterparty_stfu.take() {
+			if let Some(stfu) = self.stfu(&stfu, logger)? {
+				log_trace!(logger, "WILMER replying to counterparty stfu");
+				return Ok(stfu);
+			}
+			debug_assert!(false);
+			return Err(ChannelError::Ignore("We already sent `stfu`".to_owned()));
+		}
+
+		debug_assert_eq!(self.context.channel_state, ChannelState::ChannelReady(ChannelReadyFlags::AWAITING_QUIESCENCE));
+		self.context.channel_state.clear_awaiting_quiescence();
+		self.context.channel_state.set_local_stfu_sent();
+		self.mark_awaiting_response();
+		Ok(msgs::Stfu { channel_id: self.context.channel_id, initiator: true })
+	}
+
+	pub fn stfu<L: Deref>(&mut self, msg: &msgs::Stfu, logger: &L) -> Result<Option<msgs::Stfu>, ChannelError> where L::Target: Logger {
+		log_trace!(logger, "WILMER received stfu");
+		if !self.context.is_live() {
+			return Err(ChannelError::Warn("Peer sent `stfu` when we were not in a live state".to_owned()));
+		}
+		if self.context.node_has_pending_update(false, logger) {
+			self.context.pending_counterparty_stfu = Some(msg.clone());
+			return Err(ChannelError::Ignore("Stashing `stfu` from counterparty until state machine is no longer pending".to_owned()));
+		}
+
+		let stfu = if matches!(self.context.channel_state, ChannelState::ChannelReady(f) if f.is_empty()) {
+			debug_assert!(msg.initiator);
+			self.context.quiescence_initiator = Some(false);
+			Some(msgs::Stfu { channel_id: self.context.channel_id, initiator: false })
+		} else if matches!(self.context.channel_state, ChannelState::ChannelReady(f) if f == ChannelReadyFlags::AWAITING_QUIESCENCE) {
+			debug_assert!(msg.initiator);
+			self.context.quiescence_initiator = Some(self.context.is_outbound());
+			Some(msgs::Stfu { channel_id: self.context.channel_id, initiator: true })
+		} else if matches!(self.context.channel_state, ChannelState::ChannelReady(f) if f == ChannelReadyFlags::LOCAL_STFU_SENT) {
+			self.context.sent_message_awaiting_response = None;
+			self.context.quiescence_initiator = Some(!msg.initiator || self.context.is_outbound());
+			None
+		} else if matches!(self.context.channel_state, ChannelState::ChannelReady(f) if f == ChannelReadyFlags::REMOTE_STFU_SENT) {
+			return Err(ChannelError::Warn("Peer sent `stfu` when they already sent it and we've yet to become quiescent".to_owned()));
+		} else {
+			debug_assert!(false, "There aren't any other applicable flags on `ChannelReady` we need to check");
+			None
+		};
+
+		if let Some(quiescence_initiator) = self.context.quiescence_initiator {
+			log_debug!(logger, "WILMER Channel became quiescent, initiator={}", quiescence_initiator);
+			self.context.channel_state = ChannelState::ChannelQuiescent;
+			if !quiescence_initiator {
+				// We've entered quiescence and they are the initiator, make sure we disconnect if they
+				// don't do anything with it.
+				self.mark_awaiting_response();
+			}
+		} else {
+			log_trace!(logger, "WILMER Channel not yet quiescent, current state = {:?}", self.context.channel_state);
+		}
+
+		Ok(stfu)
+	}
+
+	pub fn is_quiescent(&self) -> bool {
+		self.context.channel_state == ChannelState::ChannelQuiescent
+	}
+
+	#[cfg(any(test, fuzzing))]
+	pub fn exit_quiescence(&mut self) {
+		println!("WILMER Exiting quiescence");
+		assert!(self.is_quiescent());
+		self.context.channel_state = ChannelState::ChannelReady(ChannelReadyFlags::new());
+		self.context.quiescence_initiator.take();
+	}
 }
 
 /// A not-yet-funded outbound (from holder) channel using V1 channel establishment.
@@ -8629,11 +8865,19 @@ impl<SP: Deref> Writeable for Channel<SP> where SP::Target: SignerProvider {
 		self.context.channel_id.write(writer)?;
 		{
 			let mut channel_state = self.context.channel_state;
-			if matches!(channel_state, ChannelState::AwaitingChannelReady(_)|ChannelState::ChannelReady(_)) {
-				channel_state.set_peer_disconnected();
-			} else {
-				debug_assert!(false, "Pre-funded/shutdown channels should not be written");
+			match channel_state {
+				ChannelState::AwaitingChannelReady(_) => {},
+				ChannelState::ChannelReady(_) => {
+					channel_state.clear_awaiting_quiescence();
+					channel_state.clear_local_stfu_sent();
+					channel_state.clear_remote_stfu_sent();
+				},
+				ChannelState::ChannelQuiescent => {
+					channel_state = ChannelState::ChannelReady(ChannelReadyFlags::new());
+				},
+				_ => debug_assert!(false, "Pre-funded/shutdown channels should not be written"),
 			}
+			channel_state.set_peer_disconnected();
 			channel_state.to_u32().write(writer)?;
 		}
 		self.context.channel_value_satoshis.write(writer)?;
@@ -9561,6 +9805,9 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 
 				blocked_monitor_updates: blocked_monitor_updates.unwrap(),
 				is_manual_broadcast: is_manual_broadcast.unwrap_or(false),
+
+				pending_counterparty_stfu: None,
+				quiescence_initiator: None,
 			},
 			#[cfg(any(dual_funding, splicing))]
 			dual_funding_channel_context: None,

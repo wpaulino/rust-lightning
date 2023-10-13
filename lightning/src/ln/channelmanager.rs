@@ -4079,7 +4079,7 @@ where
 				match chan_phase_entry.get_mut() {
 					ChannelPhase::Funded(chan) => {
 						if !chan.context.is_live() {
-							return Err(APIError::ChannelUnavailable{err: "Peer for first hop currently disconnected".to_owned()});
+							return Err(APIError::ChannelUnavailable{err: "First hop currently not available".to_owned()});
 						}
 						let funding_txo = chan.context.get_funding_txo().unwrap();
 						let logger = WithChannelContext::from(&self.logger, &chan.context, Some(*payment_hash));
@@ -8274,6 +8274,47 @@ where
 		Ok(())
 	}
 
+	fn internal_stfu(&self, counterparty_node_id: &PublicKey, msg: &msgs::Stfu) -> Result<bool, MsgHandleErrInternal> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+			debug_assert!(false);
+			MsgHandleErrInternal::send_err_msg_no_close(
+				format!("Can't find a peer matching the passed counterparty node_id {}", counterparty_node_id),
+				msg.channel_id
+			)
+		})?;
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		let peer_state = &mut *peer_state_lock;
+		if !self.init_features().supports_quiescence() {
+			return Err(MsgHandleErrInternal::send_err_msg_no_close(
+				"We do not support quiescense".to_string(), msg.channel_id
+			));
+		}
+		let mut sent_stfu = false;
+		match peer_state.channel_by_id.entry(msg.channel_id) {
+			hash_map::Entry::Occupied(mut chan_phase_entry) => {
+				if let ChannelPhase::Funded(chan) = chan_phase_entry.get_mut() {
+					if let Some(stfu) = try_chan_phase_entry!(self, chan.stfu(&msg, &self.logger), chan_phase_entry) {
+						sent_stfu = true;
+						peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
+							node_id: *counterparty_node_id,
+							msg: stfu,
+						});
+					}
+				} else {
+					let msg = "Peer sent `stfu` for an unfunded channel";
+					let err = Err(ChannelError::Close((msg.into(), ClosureReason::ProcessingError { err: msg.into() })));
+					return try_chan_phase_entry!(self, err, chan_phase_entry);
+				}
+			},
+			hash_map::Entry::Vacant(_) => return Err(MsgHandleErrInternal::send_err_msg_no_close(
+				format!("Got a message for a channel from the wrong node! No such channel for the passed counterparty_node_id {}", counterparty_node_id),
+				msg.channel_id
+			))
+		}
+		Ok(sent_stfu)
+	}
+
 	fn internal_announcement_signatures(&self, counterparty_node_id: &PublicKey, msg: &msgs::AnnouncementSignatures) -> Result<(), MsgHandleErrInternal> {
 		let per_peer_state = self.per_peer_state.read().unwrap();
 		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
@@ -8779,6 +8820,34 @@ where
 		has_update
 	}
 
+	fn maybe_send_stfu(&self) -> bool {
+		let mut has_update = false;
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		for (_cp_id, peer_state_mutex) in per_peer_state.iter() {
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			let pending_msg_events = &mut peer_state.pending_msg_events;
+			for (_channel_id, phase) in &mut peer_state.channel_by_id {
+				if let ChannelPhase::Funded(chan) = phase {
+					match chan.send_stfu(&self.logger) {
+						Ok(stfu) => {
+							has_update = true;
+							log_trace!(self.logger, "WILMER sending stfu");
+							pending_msg_events.push(events::MessageSendEvent::SendStfu {
+								node_id: chan.context.get_counterparty_node_id(),
+								msg: stfu,
+							});
+						},
+						Err(e) => log_trace!(self.logger, "WILMER Can't send stfu yet: {}", e),
+					}
+				}
+			}
+		}
+
+		has_update
+	}
+
 	/// Handle a list of channel failures during a block_connected or block_disconnected call,
 	/// pushing the channel monitor update (if any) to the background events queue and removing the
 	/// Channel object.
@@ -8803,6 +8872,74 @@ where
 			}
 			self.finish_close_channel(failure);
 		}
+	}
+
+	#[cfg(any(test, fuzzing))]
+	pub fn propose_quiescence(&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {}", counterparty_node_id)
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		if !peer_state.latest_features.supports_quiescence() {
+			return Err(APIError::APIMisuseError { err: "Peer does not support quiescence".to_string() });
+		}
+		match peer_state.channel_by_id.entry(channel_id.clone()) {
+			hash_map::Entry::Occupied(mut chan_phase_entry) => {
+				if let ChannelPhase::Funded(chan) = chan_phase_entry.get_mut() {
+					match chan.propose_quiescence(&self.logger) {
+						Ok(None) => {},
+						Ok(Some(stfu)) => {
+							log_trace!(self.logger, "WILMER sending initial stfu upon proposal");
+							peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
+								node_id: *counterparty_node_id, msg: stfu
+							});
+						},
+						Err(msg) => {
+							return Err(APIError::ChannelUnavailable { err: msg.to_string() });
+						},
+					}
+				} else {
+					return Err(APIError::ChannelUnavailable {
+						err: format!("Channel {} is not ready to propose quiescence", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => return Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+		Ok(())
+	}
+
+	#[cfg(any(test, fuzzing))]
+	pub fn exit_quiescence(&self, counterparty_node_id: &PublicKey, channel_id: &ChannelId) -> Result<(), APIError> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id)
+			.ok_or_else(|| APIError::ChannelUnavailable {
+				err: format!("Can't find a peer matching the passed counterparty node_id {}", counterparty_node_id)
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		match peer_state.channel_by_id.entry(channel_id.clone()) {
+			hash_map::Entry::Occupied(mut chan_phase_entry) => {
+				if let ChannelPhase::Funded(chan) = chan_phase_entry.get_mut() {
+					if chan.is_quiescent() {
+						chan.exit_quiescence();
+					}
+				} else {
+					return Err(APIError::APIMisuseError {
+						err: format!("Channel {} cannot be quiescent", channel_id),
+					})
+				}
+			},
+			hash_map::Entry::Vacant(_) => return Err(APIError::ChannelUnavailable {
+				err: format!("Channel with id {} not found for the passed counterparty node_id {}",
+					channel_id, counterparty_node_id),
+			}),
+		}
+		Ok(())
 	}
 }
 
@@ -9636,6 +9773,9 @@ where
 			if self.maybe_generate_initial_closing_signed() {
 				result = NotifyOption::DoPersist;
 			}
+			if self.maybe_send_stfu() {
+				result = NotifyOption::DoPersist;
+			}
 
 			let mut is_any_peer_connected = false;
 			let mut pending_events = Vec::new();
@@ -10198,9 +10338,20 @@ where
 	}
 
 	fn handle_stfu(&self, counterparty_node_id: PublicKey, msg: &msgs::Stfu) {
-		let _: Result<(), _> = handle_error!(self, Err(MsgHandleErrInternal::send_err_msg_no_close(
-			"Quiescence not supported".to_owned(),
-			msg.channel_id.clone())), counterparty_node_id);
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_stfu(&counterparty_node_id, msg);
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(sent_stfu) => if *sent_stfu {
+					NotifyOption::SkipPersistHandleEvents
+				} else {
+					NotifyOption::SkipPersistNoEvents
+				},
+			};
+			let _ = handle_error!(self, res, counterparty_node_id);
+			persist
+		});
 	}
 
 	#[cfg(splicing)]
@@ -11101,6 +11252,7 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 	if config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx {
 		features.set_anchors_zero_fee_htlc_tx_optional();
 	}
+	features.set_quiescence_optional();
 	features
 }
 
