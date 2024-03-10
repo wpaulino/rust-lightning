@@ -5196,14 +5196,8 @@ impl<SP: Deref> Channel<SP> where
 		self.context.monitor_pending_update_adds.append(&mut pending_update_adds);
 
 		if self.context.channel_state.is_monitor_update_in_progress() {
-			// We can't actually generate a new commitment transaction (incl by freeing holding
-			// cells) while we can't update the monitor, so we just return what we have.
 			if require_commitment {
 				self.context.monitor_pending_commitment_signed = true;
-				// When the monitor updating is restored we'll call
-				// get_last_commitment_update_for_send(), which does not update state, but we're
-				// definitely now awaiting a remote revoke before we can step forward any more, so
-				// set it here.
 				let mut additional_update = self.build_commitment_no_status_check(logger);
 				// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
 				// strictly increasing by one, so decrement it here.
@@ -5217,7 +5211,7 @@ impl<SP: Deref> Channel<SP> where
 			return_with_htlcs_to_fail!(Vec::new());
 		}
 
-		match self.free_holding_cell_htlcs(fee_estimator, logger) {
+		match self.maybe_free_holding_cell_htlcs(fee_estimator, logger) {
 			(Some(mut additional_update), htlcs_to_fail) => {
 				// free_holding_cell_htlcs may bump latest_monitor_id multiple times but we want them to be
 				// strictly increasing by one, so decrement it here.
@@ -5232,6 +5226,7 @@ impl<SP: Deref> Channel<SP> where
 			},
 			(None, htlcs_to_fail) => {
 				if require_commitment {
+					// We can't generate a new commitment transaction yet so we just return what we have.
 					let mut additional_update = self.build_commitment_no_status_check(logger);
 
 					// build_commitment_no_status_check may bump latest_monitor_id but we want them to be
@@ -5239,10 +5234,24 @@ impl<SP: Deref> Channel<SP> where
 					self.context.latest_monitor_update_id = monitor_update.update_id;
 					monitor_update.updates.append(&mut additional_update.updates);
 
-					log_debug!(logger, "Received a valid revoke_and_ack for channel {}. Responding with a commitment update with {} HTLCs failed. {} monitor update.",
-						&self.context.channel_id(),
-						update_fail_htlcs.len() + update_fail_malformed_htlcs.len(),
-						release_state_str);
+					log_debug!(logger, "Received a valid revoke_and_ack for channel {}. {} monitor update.",
+						&self.context.channel_id(), release_state_str);
+					if self.context.channel_state.can_generate_new_commitment() {
+						log_debug!(logger, "Responding with a commitment update with {} HTLCs failed for channel {}",
+							update_fail_htlcs.len() + update_fail_malformed_htlcs.len(),
+							&self.context.channel_id);
+					} else {
+						debug_assert!(htlcs_to_fail.is_empty());
+						let reason = if self.context.channel_state.is_local_stfu_sent() {
+							"exits quiescence"
+						} else if self.context.channel_state.is_monitor_update_in_progress() {
+							"completes pending monitor update"
+						} else {
+							"can continue progress"
+						};
+						log_debug!(logger, "Holding back commitment update until channel {} {}",
+							&self.context.channel_id, reason);
+					}
 
 					self.monitor_updating_paused(false, true, false, to_forward_infos, revoked_htlcs, finalized_claimed_htlcs);
 					return_with_htlcs_to_fail!(htlcs_to_fail);
