@@ -161,6 +161,7 @@ pub enum MonitorEvent {
 	/// [`ChannelMonitorUpdateStatus::InProgress`]: super::ChannelMonitorUpdateStatus::InProgress
 	Completed {
 		/// The funding outpoint of the [`ChannelMonitor`] that was updated
+		// TODO: remove?
 		funding_txo: OutPoint,
 		/// The channel ID of the channel associated with the [`ChannelMonitor`]
 		channel_id: ChannelId,
