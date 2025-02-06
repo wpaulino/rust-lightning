@@ -1063,14 +1063,6 @@ impl ClaimablePayments {
 /// [`ChannelMonitorUpdate`]s are applied.
 #[derive(Debug)]
 enum BackgroundEvent {
-	/// Handle a ChannelMonitorUpdate which closes the channel or for an already-closed channel.
-	/// This is only separated from [`Self::MonitorUpdateRegeneratedOnStartup`] as for truly
-	/// ancient [`ChannelMonitor`]s that haven't seen an update since LDK 0.0.118 we may not have
-	/// the counterparty node ID available.
-	///
-	/// Note that any such events are lost on shutdown, so in general they must be updates which
-	/// are regenerated on startup.
-	ClosedMonitorUpdateRegeneratedOnStartup((OutPoint, ChannelId, ChannelMonitorUpdate)),
 	/// Handle a ChannelMonitorUpdate which may or may not close the channel and may unblock the
 	/// channel to continue normal operation.
 	///
@@ -6392,11 +6384,6 @@ where
 
 		for event in background_events.drain(..) {
 			match event {
-				BackgroundEvent::ClosedMonitorUpdateRegeneratedOnStartup((_funding_txo, channel_id, update)) => {
-					// The channel has already been closed, so no use bothering to care about the
-					// monitor updating completing.
-					let _ = self.chain_monitor.update_channel(channel_id, &update);
-				},
 				BackgroundEvent::MonitorUpdateRegeneratedOnStartup { counterparty_node_id, funding_txo, channel_id, update } => {
 					self.apply_post_close_monitor_update(counterparty_node_id, channel_id, funding_txo, update);
 				},
