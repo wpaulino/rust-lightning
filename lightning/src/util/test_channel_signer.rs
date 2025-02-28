@@ -30,6 +30,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::sighash;
 use bitcoin::sighash::EcdsaSighashType;
 use bitcoin::transaction::Transaction;
+use bitcoin::Txid;
 
 #[cfg(taproot)]
 use crate::ln::msgs::PartialSignatureWithNonce;
@@ -209,8 +210,10 @@ impl ChannelSigner for TestChannelSigner {
 		Ok(())
 	}
 
-	fn pubkeys(&self) -> &ChannelPublicKeys {
-		self.inner.pubkeys()
+	fn pubkeys(
+		&self, parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> ChannelPublicKeys {
+		self.inner.pubkeys(parent_funding_txid, secp_ctx)
 	}
 
 	fn channel_keys_id(&self) -> [u8; 32] {
@@ -466,9 +469,10 @@ impl EcdsaChannelSigner for TestChannelSigner {
 	}
 
 	fn sign_channel_announcement_with_funding_key(
-		&self, msg: &msgs::UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>,
+		&self, channel_parameters: &ChannelTransactionParameters,
+		msg: &msgs::UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<Signature, ()> {
-		self.inner.sign_channel_announcement_with_funding_key(msg, secp_ctx)
+		self.inner.sign_channel_announcement_with_funding_key(channel_parameters, msg, secp_ctx)
 	}
 
 	fn sign_splicing_funding_input(
